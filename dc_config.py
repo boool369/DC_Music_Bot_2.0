@@ -7,8 +7,18 @@ import os
 load_dotenv() 
 token = os.getenv("DISCORD_BOT_TOKEN")  
 
-intents = discord.Intents.all() 
-bot = commands.Bot(command_prefix="/", intents=intents)  
+intents = discord.Intents.all()
+
+# --- 最小改动：添加代理配置 ---
+proxy_url = os.getenv("PROXY_URL")
+bot_kwargs = {"command_prefix": "/", "intents": intents}
+
+if proxy_url:
+    # discord.py 的 Bot 构造函数接受 'proxy' 参数
+    bot_kwargs["proxy"] = proxy_url
+
+#bot = commands.Bot(command_prefix="/", intents=intents)
+bot = commands.Bot(**bot_kwargs)
 tree = bot.tree  
 
 class MusicPlayer:

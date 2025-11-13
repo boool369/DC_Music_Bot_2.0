@@ -1,10 +1,15 @@
+# downloader.py 头部
+
 import yt_dlp
 from typing import Optional
 import re
 from tools import download_status
 import threading
 import queue
-import os
+import os # 确保 os 已导入
+from dotenv import load_dotenv # 导入 load_dotenv
+
+load_dotenv() # 加载 .env 变量
 
 fragment = 6
 download_task = queue.Queue()
@@ -85,7 +90,11 @@ def video_mp3():
             "concurrent_fragment_downloads": fragment,
             #"cookiefile": "cookies.txt"
         }
-
+        # --- 最小改动：添加代理配置 ---
+        proxy_url = os.getenv("PROXY_URL")
+        if proxy_url:
+            ydl_opts["proxy"] = proxy_url
+        # ----------------------------
         while True:
             try:
                 data = download_task.get(timeout=0.01) 

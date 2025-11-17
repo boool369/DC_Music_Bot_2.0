@@ -5,15 +5,22 @@ import subprocess
 import re
 import time
 from dc_config import messages, music_player
-import psutil
 from dotenv import load_dotenv
 
 # 加载环境变量
 load_dotenv()
 
+# --- 全局变量和缓存 ---
 downloaded = []
 # 从 .env 读取 MUSIC_DIR
 music_dir = os.getenv("MUSIC_DIR", "mp3")
+
+# --- 索引缓存（实现启动时索引和手动刷新）---
+_music_cache: List[Dict[str, Union[str, list]]] = []
+_last_scan_time: float = 0
+
+
+# --------------------
 
 
 def download_status(status: Optional[Dict[str, Union[str, float]]] = None, query_id: Optional[str] = None) -> Optional[
@@ -37,184 +44,259 @@ def download_status(status: Optional[Dict[str, Union[str, float]]] = None, query
     return None
 
 
-def get_music(check: Optional[str] = None) -> Optional[List[Dict[str, Union[str, list]]]]:
-    """返回播放列表和音乐 (使用 rglob 递归查找多媒体文件)"""
-    music = []
-    music_path = Path(music_dir)
-
-    # 支持的音频文件后缀
-    AUDIO_EXTENSIONS = ['*.mp3', '*.ogg', '*.opus', '*.webm']
-
-    if music_path.exists():
-        playlists = {}
-        root_music = []
-
-        # rglob 递归查找
-        for ext in AUDIO_EXTENSIONS:
-            for item in music_path.rglob(ext):
-                if item.is_file():
-                    try:
-                        relative_path = item.relative_to(music_path)
-                    except ValueError:
-                        continue
-
-                    if len(relative_path.parts) == 1:
-                        # 根目录下的文件
-                        root_music.append({"path": item, "name": item.stem})
-                    elif len(relative_path.parts) >= 2:
-                        # 使用包含音乐文件的父目录的完整相对路径作为播放列表名
-                        parent_dir_path = str(item.parent.relative_to(music_path)).replace(os.path.sep, '/')
-                        song_name = item.stem
-
-                        if parent_dir_path not in playlists:
-                            playlists[parent_dir_path] = []
-
-                        # 无论文件在多深的子目录，都归入这个父目录播放列表
-                        playlists[parent_dir_path].append({"path": item, "name": song_name})
-
-        # 1. 构造播放列表数据
-        for name, songs in playlists.items():
-            songs.sort(key=lambda x: x["name"])
-            paths = [song["path"] for song in songs]
-
-            music.append({
-                "type": "playlist",
-                "name": name,  # 完整路径，例如 'RJ1473335/mp3'
-                "music": [song["name"] for song in songs],
-                "paths": paths
-            })
-
-        # 2. 构造根目录音乐数据
-        root_music.sort(key=lambda x: x["name"])
-        for song in root_music:
-            music.append({
-                "type": "mp3",
-                "name": song["name"],
-                "music": [song["name"]],
-                "paths": [song["path"]]
-            })
-
-        # 3. 过滤 (如果提供了 check)
-        if check:
-            filtered_music = []
-
-            # 尝试匹配播放列表名或根目录音乐名 (check 现在只需要是 'RJ1473335/mp3' 或 'root_song')
-            for m in music:
-                if m["name"] and check.lower() == m["name"].lower():
-                    filtered_music.append(m)
-                    break
-
-            # 尝试匹配播放列表中的单曲 (name: "播放列表名/歌曲名")
-            if not filtered_music:
-                if "/" in check:
-                    # 仅分割一次
-                    playlist_check, song_check = check.rsplit("/", 1)
-                else:
-                    playlist_check, song_check = None, check
-
-                for m in music:
-                    # 只有当 check 中包含 / 且 playlist_check 匹配时才播放单曲
-                    if m["type"] == "playlist" and playlist_check and playlist_check.lower() == m[
-                        "name"].lower() and song_check.lower() in [s.lower() for s in m["music"]]:
-                        try:
-                            index = [s.lower() for s in m["music"]].index(song_check.lower())
-                            song_name = m["music"][index]
-
-                            filtered_music.append({
-                                "type": "playlist_song_temp",
-                                "name": song_name,
-                                "playlist_folder": m["name"],  # 播放列表的完整路径
-                                "music": [song_name],
-                                "paths": [m["paths"][index]]
-                            })
-                        except ValueError:
-                            pass
-                        break
-
-            return filtered_music if filtered_music else None
-
-        return music
-    return None
-
-
-def get_path(folder: Optional[str] = None, subfolder: Optional[str] = None, filename: Optional[str] = None) -> Path:
-    """返回合成的路径 (使用 Path 对象连接)"""
-    base_path = Path(folder) if folder else Path('.')
-    parts = [part for part in [subfolder, filename] if part]
-    return base_path.joinpath(*parts)
+def get_path(root_dir: str, subfolder: Optional[str] = None, filename: Optional[str] = None) -> Path:
+    """构建 Path 对象"""
+    p = Path(root_dir)
+    if subfolder:
+        p /= subfolder
+    if filename:
+        p /= filename
+    return p
 
 
 def verify_name(name: str) -> str:
-    """清理文件名或文件夹名中的非法字符，允许 / 作为路径分隔符"""
-    # 允许 / 作为分隔符，只清理其他非法字符
-    name = re.sub(r'[<>:"\\|?*]', '', name)
-    return name.strip()
+    """验证文件名或路径中是否存在非法字符"""
+    # 非法字符：< > : " | ? *
+    name = re.sub(r'[<>:"|?*]', '', name)
+    name = name.strip()
+    return name
 
 
-def get_name(name: str) -> str:
-    """获取不带扩展和路径名称"""
-    itemname = os.path.basename(name)
-    return os.path.splitext(itemname)[0]
+def time_to_seconds(time_str: str) -> float:
+    """将 mm:ss 或 s 转换为总秒数"""
+    if not time_str:
+        return 0.0
+    if ':' in time_str:
+        parts = time_str.split(':')
+        if len(parts) == 2:
+            minutes, seconds = map(float, parts)
+            return minutes * 60 + seconds
+        elif len(parts) == 3:
+            hours, minutes, seconds = map(float, parts)
+            return hours * 3600 + minutes * 60 + seconds
+    try:
+        return float(time_str)
+    except ValueError:
+        return 0.0
 
 
-def get_music_duration(filepath: Path) -> tuple[float, int, int]:
-    """使用 ffprobe 获取音频长度"""
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(filepath)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT
-    )
-    total_seconds = float(result.stdout)
-    minutes = int(total_seconds) // 60
-    seconds = int(total_seconds) % 60
-    return total_seconds, minutes, seconds
+def get_music_duration(file_path: Path) -> tuple[float, str, str]:
+    """获取音乐时长（秒、mm:ss 格式、h:mm:ss 格式）"""
+    try:
+        # 使用 ffprobe 获取时长
+        command = [
+            'ffprobe',
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            str(file_path)
+        ]
+        # 在 Windows 上隐藏命令行窗口
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        result = subprocess.run(command, capture_output=True, text=True, check=True, creationflags=creationflags)
+        duration_sec = float(result.stdout.strip())
+
+        # 格式化
+        duration_int = int(duration_sec)
+        h = duration_int // 3600
+        m = (duration_int % 3600) // 60
+        s = duration_int % 60
+
+        mm_ss = f"{m:d}:{s:02d}"
+        h_mm_ss = f"{h:d}:{m:02d}:{s:02d}" if h > 0 else mm_ss
+
+        return duration_sec, mm_ss, h_mm_ss
+
+    except Exception:
+        # 错误时返回默认值
+        return 0.0, "0:00", "0:00"
 
 
-def get_player() -> dict[str, Union[str, list[str], None]]:
-    """获取播放器状态"""
-    first_item = music_player.play_queue[music_player.current_track_index] if music_player.play_queue else None
-
-    # 从 Path 中提取播放列表名（完整相对路径）
-    from_playlist = first_item and first_item.parent != Path(music_dir)
-
-    if from_playlist and first_item:
-        try:
-            # 播放列表名现在是文件父目录的完整相对路径 (e.g., 'RJ1473335/mp3')
-            playlist_name = str(first_item.parent.relative_to(Path(music_dir))).replace(os.path.sep, '/')
-        except ValueError:
-            playlist_name = None
+def get_name(path: Path) -> str:
+    """从路径获取歌曲或列表名称"""
+    relative_path = path.relative_to(Path(music_dir))
+    if len(relative_path.parts) > 1:
+        # 播放列表歌曲: "列表名/歌曲名"
+        return f"{relative_path.parts[0]}/{path.stem}"
     else:
-        playlist_name = None
+        # 根目录歌曲: "歌曲名"
+        return path.stem
+
+
+# --- 优化后的 get_music 函数 ---
+def get_music(check: Optional[str] = None) -> Optional[List[Dict[str, Union[str, list]]]]:
+    """
+    返回播放列表和音乐 (使用 rglob 递归查找多媒体文件)。
+    如果 check="force_rescan"，则强制重新扫描文件系统。
+    """
+    global _music_cache, _last_scan_time
+
+    # 检查是否需要强制重新扫描
+    if check != "force_rescan" and _music_cache:
+        # 如果不是强制刷新，且缓存不为空，则直接返回缓存
+        return _music_cache
+
+    music = []
+
+    # 清空缓存，准备重新扫描
+    _music_cache = []
+    _last_scan_time = time.time()
+
+    music_path = Path(music_dir)
+    if not music_path.exists():
+        print(f"WARNING: Music directory {music_dir} does not exist.")
+        return None
+
+    # rglob 递归查找所有 .mp3, .m4a, .flac 文件
+    all_files = list(music_path.rglob('*.mp3')) + list(music_path.rglob('*.m4a')) + list(music_path.rglob('*.flac'))
+
+    playlists = {}
+
+    for file_path in all_files:
+        # 计算相对于 music_dir 的路径
+        try:
+            relative_path = file_path.relative_to(music_path)
+        except ValueError:
+            # 文件不在 music_dir 下，跳过
+            continue
+
+        # 检查是否在子文件夹中（即播放列表）
+        if len(relative_path.parts) > 1:
+            # 播放列表：文件夹名是播放列表名
+            playlist_name = relative_path.parts[0]
+            song_name = file_path.stem
+
+            if playlist_name not in playlists:
+                playlists[playlist_name] = {
+                    "type": "playlist",
+                    "name": playlist_name,
+                    "music": [],  # 歌曲名称列表 (仅文件名)
+                    "paths": []  # 歌曲的绝对路径列表 (Path对象)
+                }
+
+            playlists[playlist_name]["music"].append(song_name)
+            playlists[playlist_name]["paths"].append(file_path)
+
+        else:
+            # 根目录歌曲 (单曲)
+            music.append({
+                "type": "mp3",
+                "name": file_path.stem,
+                "paths": [file_path]  # 单曲的绝对路径
+            })
+
+    # 将播放列表添加到结果中
+    music.extend(list(playlists.values()))
+
+    # 更新缓存
+    _music_cache = music
+
+    # 打印日志
+    print(f"DEBUG: Music index refreshed. Found {len(music)} items (including playlists).")
+
+    return music
+
+
+# ----------------------------------------------------
+
+
+def get_player() -> Dict[str, Union[str, int]]:
+    """获取播放器状态"""
+    # 假设 music_player.bot 已经从 dc_config 正确导入
+    vc = None
+    if music_player.play_queue and hasattr(music_player, 'bot') and music_player.bot:
+        try:
+            # 尝试通过 guild_id 获取 voice_client，但这行代码依赖于 music_player 中存储 guild_id
+            # 简化：直接尝试从 bot.voice_clients 中查找
+            if music_player.bot.voice_clients:
+                vc = music_player.bot.voice_clients[0]
+        except Exception:
+            pass  # 无法获取 vc
+
+    current_time_str = "0:00"
+    total_time_str = "0:00"
+    current_path = None
+    status = "空闲"
+    playlist_name = None
+    current_music = None
+
+    if music_player.play_queue:
+        current_path = music_player.play_queue[music_player.current_track_index]
+        current_music = current_path.stem
+
+        # 尝试获取播放列表名
+        try:
+            relative_path = current_path.relative_to(Path(music_dir))
+            if len(relative_path.parts) > 1:
+                playlist_name = relative_path.parts[0]
+        except ValueError:
+            pass
+
+        if vc and vc.is_playing():
+            status = "播放中"
+        elif vc and vc.is_paused():
+            status = "暂停"
+
+        # 只有在播放或暂停时才计算时间
+        if status != "空闲":
+            _, total_time_str, _ = get_music_duration(current_path)
+            # 注意：实际播放进度在 discord.py 中难以准确获取，这里保持简化
+            current_time_str = "0:00"
+
+            if not total_time_str:
+                total_time_str = "0:00"
+
+    # 格式化播放模式
+    mode_text = messages['playback_mode'].get(music_player.playback_mode, '未知模式')
 
     player_data = {
-        # play_queue 现在只返回歌曲名
-        "play_queue": [p.stem for p in music_player.play_queue] if from_playlist else None,
-        # 播放列表名现在是完整路径
+        "status": status,
+        "current_path": str(current_path) if current_path else None,
         "playlist_name": playlist_name,
-        "current_music": first_item.stem if first_item else None,
-        "playback_mode": messages['playback_mode'][music_player.playback_mode],
+        "current_music": current_music,
+        "current_time": current_time_str,
+        "total_time": total_time_str,
+        "playback_mode": music_player.playback_mode,
+        "playback_mode_text": mode_text,
         "current_volume": f"{int(music_player.current_volume * 100)}%"
     }
     return player_data
 
 
 def check_music_open(name: str) -> bool:
-    """检查音乐是否被占用 (使用新的播放列表逻辑)"""
+    """检查音乐是否被占用 (播放中)"""
     player_data = get_player()
-    current_music = player_data.get("current_music")
-    playlist_name = player_data.get("playlist_name")
+    current_path = player_data.get("current_path")
 
-    if current_music:
-        # 检查是否正在播放该播放列表（完整路径）或该单曲
-        if playlist_name == name or current_music == name:
-            # 简化检查，仅检查播放器状态
-            return True
+    if player_data.get('status') == '空闲' or not current_path:
+        return False
+
+    current_path_obj = Path(current_path)
+
+    # 1. 检查是否是单曲删除 (name 是 stem)
+    if current_path_obj.stem == name:
+        return True
+
+    # 2. 检查是否是播放列表歌曲删除 (name 是 "列表名/歌曲名")
+    if "/" in name:
+        playlist_name, song_name = name.rsplit("/", 1)
+        try:
+            relative_path = current_path_obj.relative_to(Path(music_dir))
+            if len(relative_path.parts) > 1 and relative_path.parts[
+                0] == playlist_name and current_path_obj.stem == song_name:
+                return True
+        except ValueError:
+            pass
+
+    # 3. 检查是否是整个播放列表删除 (name 是列表名)
+    if player_data.get("playlist_name") == name:
+        return True
+
     return False
 
 
 def edit_play_queue(music: Optional[Path] = None, music_name: Optional[str] = None, playlist: Optional[str] = None):
-    """修改播放队列 (使用新的播放列表逻辑)"""
+    """从播放队列中移除歌曲或播放列表"""
 
     if not music_player.play_queue:
         return
@@ -224,15 +306,25 @@ def edit_play_queue(music: Optional[Path] = None, music_name: Optional[str] = No
         music_player.play_queue.remove(music)
 
     # 2. 删除整个播放列表 (清除队列中属于该播放列表的所有歌曲)
-    elif playlist:  # playlist 现在是完整相对路径 (e.g., 'RJ1473335/mp3')
-        # 匹配播放列表名（完整相对路径）
-        music_player.play_queue = [
-            p for p in music_player.play_queue
-            if str(p.parent.relative_to(Path(music_dir))).replace(os.path.sep, '/') != playlist
-        ]
+    elif playlist:
+        # 获取播放列表的目录 Path
+        playlist_dir = get_path(music_dir, subfolder=playlist)
 
-    # 删除后重置索引
+        # 过滤掉所有位于该播放列表目录下的歌曲
+        new_queue = []
+        for path in music_player.play_queue:
+            try:
+                # 如果路径相对于 playlist_dir 失败，说明它不在该列表下
+                path.relative_to(playlist_dir)
+                # 如果成功，说明在该列表下，不加入新队列
+            except ValueError:
+                new_queue.append(path)
+
+        music_player.play_queue = new_queue
+
+    # 重新调整当前播放索引，确保它不会越界
     if music_player.play_queue:
-        music_player.current_track_index = min(music_player.current_track_index, len(music_player.play_queue) - 1)
+        if music_player.current_track_index >= len(music_player.play_queue):
+            music_player.current_track_index = max(0, len(music_player.play_queue) - 1)
     else:
         music_player.current_track_index = 0

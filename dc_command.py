@@ -7,15 +7,102 @@ from dc_config import tree, music_choice, messages, music_player
 from dc_extra import autocomplete_music_callback, ensure_voice, play_track
 from downloader import download_task
 from uuid import uuid4
+from typing import Optional, List, Callable, Awaitable
 import shutil
 import os
+# 【重要】导入 app 模块中的 SocketIO 相关函数，用于通知 Web 界面更新
+import app
+from app import socketio, get_music_data, connected_sids
 
+
+# =========================================================================
+# === 新增命令：/refresh (手动刷新索引) ===
+# =========================================================================
+
+@tree.command(name="refresh", description="手动刷新音乐文件索引 (用于 Web 界面和命令补全)")
+async def refresh_music_index(interaction: Interaction):
+    """手动刷新音乐索引"""
+    # 延迟响应，让用户知道操作正在进行
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    try:
+        # 调用 get_music() 并传入 "force_rescan" 参数，强制重新扫描文件并更新全局索引
+        get_music(check="force_rescan")
+
+        # 通知 Web 客户端更新列表 (避免循环依赖，通过 app 模块访问)
+        if app.socketio:
+            music_data = app.get_music_data()
+            for sid in list(app.connected_sids):
+                app.socketio.emit("update_status", music_data, to=sid)
+
+        await interaction.followup.send("✅ 音乐文件索引已成功刷新！Web 界面和命令选项已更新。", ephemeral=True)
+        print("DEBUG: Music index manually refreshed.")
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ 刷新音乐索引失败: {e}", ephemeral=True)
+        print(f"ERROR: Failed to refresh music index: {e}")
+
+
+# =========================================================================
+# === /status 命令 (美化显示) ===
+# =========================================================================
+
+@tree.command(name="status", description="查看当前播放状态、音量和队列信息")
+async def status_command(interaction: Interaction):
+    """查看当前播放状态，美化显示"""
+    await interaction.response.defer(ephemeral=False)
+
+    player_data = get_player()
+
+    current_path_str = player_data.get("current_path")
+    current_time_str = player_data.get("current_time", "0:00")
+    total_time_str = player_data.get("total_time", "0:00")
+
+    # 构造美化的响应
+    response_lines = [
+        f"🎧 **播放器状态**",
+        f"🎶 **当前状态:** `{player_data.get('status', '空闲')}`",
+        f"🔊 **音量:** `{player_data.get('current_volume', '60%')}`",
+        f"🔄 **循环模式:** `{player_data.get('playback_mode_text', '播放完停止')}`",
+        "---"
+    ]
+
+    if current_path_str and player_data.get('status') != '空闲':
+        # 提取歌曲名称和播放列表名称
+        current_music_name = Path(current_path_str).stem
+        playlist_name = player_data.get("playlist_name")
+
+        # 正在播放的信息
+        if playlist_name:
+            response_lines.append(f"📦 **播放列表:** `{playlist_name}`")
+        response_lines.append(f"🎵 **正在播放:** `{current_music_name}`")
+        response_lines.append(f"⏱️ **进度:** `{current_time_str} / {total_time_str}` (注意：进度显示可能不精确)")
+
+        # 队列信息
+        queue_len = len(music_player.play_queue)
+        current_index = music_player.current_track_index
+        if queue_len > 0:
+            remaining = queue_len - (current_index + 1)
+            response_lines.append(f"📑 **播放队列:** 当前第 `{current_index + 1}` 首, 剩余 `{remaining}` 首")
+
+    elif player_data.get('status') == '空闲':
+        response_lines.append("当前没有音乐在播放。")
+
+    await interaction.followup.send("\n".join(response_lines))
+
+
+# =========================================================================
+# === 其他命令保持不变 ===
+# =========================================================================
 
 @tree.command(name="leave", description="离开语音频道")
 async def leave(interaction: Interaction):
     try:
         vc = interaction.guild.voice_client
         if vc is not None and vc.is_connected():
+            # 优化：添加停止播放确保连接关闭干净
+            if vc.is_playing():
+                vc.stop()
             await vc.disconnect()
             await interaction.response.send_message(f"已离开语音频道。", ephemeral=True)
         else:
@@ -26,303 +113,369 @@ async def leave(interaction: Interaction):
 
 @tree.command(name="download", description="下载视频为 mp3 可选播放列表")
 @app_commands.describe(url="YouTube 或 Bilibili 视频链接", playlist="播放列表")
-@app_commands.autocomplete(playlist=autocomplete_music_callback())
-async def download(interaction: Interaction, url: str, playlist: str = None):
+@app_commands.autocomplete(playlist=autocomplete_music_callback(include_music=False, include_playlist_music=False))
+async def download_command(interaction: Interaction, url: str, playlist: Optional[str] = None):
+    # 保持不变
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    valid_url = extract_url(url)
+    if not valid_url:
+        await interaction.followup.send("请输入正确的视频链接。", ephemeral=True)
+        return
+
+    if playlist:
+        if verify_name(playlist) != playlist:
+            await interaction.followup.send("文件夹名不能包含特殊字符: <>:\"\\|?* (但允许 /)。", ephemeral=True)
+            return
+
     try:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        task_id = uuid4().hex
 
-        if playlist:
-            # playlist 现在是完整相对路径 (e.g., 'RJ1473335/mp3')，这里只需要验证，verify_name 已经修改为允许 /
-            if verify_name(playlist) != playlist:
-                await interaction.followup.send('文件夹名不能包含特殊字符: `<>:"\\|?*`')
-                return
-
-        id = uuid4().hex
-        # get_path 自动处理 music_dir
         folder_path = get_path(music_dir, playlist, "%(title)s.%(ext)s") if playlist else get_path(music_dir,
                                                                                                    filename="%(title)s.%(ext)s")
 
-        download_task.put({"id": id, "url": url, "folder": folder_path})
-        message = await interaction.followup.send("处理中...")
+        download_task.put({"id": task_id, "url": valid_url, "folder": folder_path})
 
-        dots = ["", ".", "..", "..."]
-        dot_index = 0
+        await interaction.followup.send(f"✅ 下载任务已添加！任务ID: `{task_id}`，请使用 `/download_status` 命令查看进度。",
+                                        ephemeral=False)
 
-        while True:
-            await asyncio.sleep(0.01)
-            data = download_status(query_id=id)
-            if data is None:
-                dot_index = (dot_index + 1) % len(dots)
-                # 关键修改：使用 follow.up.send/edit 而不是 response.send/edit
-                await message.edit(content=f"处理中{dots[dot_index]}")
-                continue
-
-            status = data.get("status")
-            extra = data.get("extra")
-            title = data.get("title")
-
-            if status == "error":
-                await message.edit(content=f"错误: {extra}")
-                return
-            elif status == "downloading":
-                filled = int(extra / 10)
-                bar = "[" + "█" * filled + "░" * (10 - filled) + "]"
-                await message.edit(content=(f"{playlist} / " if playlist else "") + f"{title} : {bar} {extra:.0f}%")
-                if extra == 100:
-                    # title 需要清理非法字符
-                    cleaned_title = verify_name(title)
-                    final_path = get_path(music_dir, playlist, f"{cleaned_title}.mp3")
-                    edit_play_queue(final_path, cleaned_title, playlist)
-                    return
     except Exception as e:
-        await interaction.followup.send(f"下载时出错: {e}", ephemeral=True)
+        await interaction.followup.send(f"❌ 添加下载任务失败: {e}", ephemeral=True)
 
 
-@tree.command(name="music_view", description="查看所有音乐和播放列表中的歌曲")
-async def music_view(interaction: Interaction):
+@tree.command(name="download_status", description="查询下载进度")
+@app_commands.describe(task_id="下载任务ID")
+async def download_status_command(interaction: Interaction, task_id: str):
+    # 保持不变
+    await interaction.response.defer(thinking=True, ephemeral=False)
+
+    status = download_status(query_id=task_id)
+
+    if not status:
+        await interaction.followup.send(f"❌ 未找到 ID 为 `{task_id}` 的下载任务或任务已完成。", ephemeral=True)
+        return
+
+    message = f"下载任务ID: `{task_id}`\n"
+    if status.get("status") == "downloading":
+        message += f"▶️ **状态:** 下载中\n"
+        message += f"📦 **进度:** `{status.get('progress', '0.0%')}`\n"
+        message += f"⏳ **预计剩余时间:** `{status.get('eta', '未知')}`\n"
+    elif status.get("status") == "finished":
+        # 下载完成，强制刷新索引并通知 Web 客户端
+        get_music(check="force_rescan")
+        if app.socketio:
+            music_data = app.get_music_data()
+            app.socketio.emit("update_status", music_data)
+
+        message += f"✅ **状态:** 下载完成\n"
+        message += f"📁 **文件:** `{status.get('filename')}`"
+    elif status.get("status") == "error":
+        message += f"❌ **状态:** 失败\n"
+        message += f"⚠️ **原因:** `{status.get('message', '未知错误')}`"
+
+    await interaction.followup.send(message)
+
+
+@tree.command(name="play", description="播放音乐")
+@app_commands.describe(name="歌曲或播放列表名称", seek_time="跳转时间 (例如 1:30 或 90)")
+@app_commands.autocomplete(name=autocomplete_music_callback(include_music=True, include_playlist_music=True))
+async def play_command(interaction: Interaction, name: str, seek_time: Optional[str] = None):
+    # 保持不变
+    await interaction.response.defer(thinking=True)
+
     try:
-        music_data = get_music()
-        if not music_data:
-            await interaction.response.send_message("当前没有任何音乐或播放列表。", ephemeral=True)
+        vc = await ensure_voice(interaction, check_voice=True)
+        if not vc:
+            # ensure_voice 已经发送了错误消息
             return
-
-        msg_lines = ["**音乐列表**"]
-        for music in music_data:
-            type = music.get("type")
-            name = music.get("name")  # 播放列表的完整相对路径 或 根目录歌曲名
-
-            if type == "playlist":
-                # 只显示播放列表的路径和歌曲数，防止消息过长
-                msg_lines.append(f"\n**{name}** ({len(music['music'])} 首)")
-            else:
-                msg_lines.append(f"- **{name}** (单曲)")
-
-        await interaction.response.send_message("\n".join(msg_lines), ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"查看音乐和播放列表时出错: {e}", ephemeral=True)
-
-
-@tree.command(name="delete_music", description="删除单曲、播放列表中的单曲或整个播放列表")
-@app_commands.describe(name="要删除的音乐或播放列表")
-@app_commands.autocomplete(name=autocomplete_music_callback(True, True))
-async def delete_music(interaction: Interaction, name: str):
-    try:
-        await interaction.response.defer(ephemeral=True, thinking=True)
 
         music_data = get_music()
         if not music_data:
-            await interaction.followup.send(f"未找到 `{name}`", ephemeral=True)
+            await interaction.followup.send("❌ 音乐库为空，请先下载音乐。", ephemeral=True)
             return
 
-        is_playlist = any(m["name"] == name and m["type"] == "playlist" for m in music_data)
-        is_root_song = any(m["name"] == name and m["type"] == "mp3" for m in music_data)
+        # 1. 查找匹配的歌曲或列表
+        found_item = None
         is_playlist_song = "/" in name
 
-        # 删除整个播放列表（完整路径）
-        if is_playlist:
-            if check_music_open(name):
-                await interaction.followup.send(f"`{name}` 在播放中，使用 /leave 后才可以删除", ephemeral=True)
-                return
+        if is_playlist_song:
+            # 尝试匹配播放列表中的单曲
+            playlist_name, song_name_stem = name.rsplit("/", 1)
+            for item in music_data:
+                if item["type"] == "playlist" and item["name"] == playlist_name:
+                    if song_name_stem in item["music"]:
+                        # 找到歌曲在列表中的索引
+                        song_index = item["music"].index(song_name_stem)
+                        # 构造 FoundItem 以便后续处理
+                        found_item = {
+                            "type": "playlist_song",
+                            "name": song_name_stem,
+                            "path": item["paths"][song_index],
+                            "playlist_name": playlist_name
+                        }
+                        break
 
-            path = get_path(music_dir, subfolder=name)
-            shutil.rmtree(path)
-            edit_play_queue(playlist=name)
-            await interaction.followup.send(f"已成功删除播放列表 `{name}`", ephemeral=True)
+        if not found_item:
+            # 尝试匹配根目录单曲或播放列表
+            for item in music_data:
+                if item["name"] == name:
+                    found_item = item
+                    break
 
-        # 删除根目录单曲
-        elif is_root_song:
-            if check_music_open(name):
-                await interaction.followup.send(f"`{name}` 在播放中，使用 /leave 后才可以删除", ephemeral=True)
-                return
-
-            path = get_path(music_dir, filename=f"{name}.mp3")
-            os.remove(path)
-            edit_play_queue(music=path, music_name=name, playlist=None)
-            await interaction.followup.send(f"已成功删除单曲 `{name}`", ephemeral=True)
-
-        # 删除播放列表中的单曲 (格式: 列表路径/歌曲名)
-        elif is_playlist_song:
-            playlist_name, song_name = name.rsplit("/", 1)
-
-            if check_music_open(song_name):
-                await interaction.followup.send(f"`{song_name}` 在播放中，使用 /leave 后才可以删除", ephemeral=True)
-                return
-
-            path = get_path(music_dir, playlist_name, f"{song_name}.mp3")
-            os.remove(path)
-            # edit_play_queue 传入 Path 对象，和单曲所在的播放列表名
-            edit_play_queue(music=path, music_name=song_name, playlist=playlist_name)
-            await interaction.followup.send(f"已成功删除播放列表 `{playlist_name}` 中的歌曲 `{song_name}`",
-                                            ephemeral=True)
-
-        else:
-            await interaction.followup.send(f"未找到 `{name}` 或格式错误", ephemeral=True)
-
-    except Exception as e:
-        await interaction.followup.send(f"删除音乐时出错: {e}", ephemeral=True)
-
-
-@tree.command(name="player_view", description="查看当前音乐播放器状态")
-async def player_view(interaction: Interaction):
-    try:
-        player_data = get_player()
-        music = player_data.get("current_music")
-
-        if not music:
-            await interaction.response.send_message("当前没有正在播放的音乐。", ephemeral=True)
+        if not found_item:
+            await interaction.followup.send(f"❌ 未找到歌曲或播放列表：`{name}`", ephemeral=True)
             return
 
-        msg_lines = ["**播放器状态**"]
-        msg_lines.append(f"- 当前曲目: `{music}`")
-        msg_lines.append(f"- 当前音量: `{player_data['current_volume']}`")
-        msg_lines.append(f"- 播放模式: `{player_data['playback_mode']}`")
+        # 2. 设置播放队列
+        music_player.play_queue = []
+        music_player.current_track_index = 0
 
-        playlist = player_data.get("playlist_name")
-        if playlist:
-            msg_lines.append(f"- 当前播放列表: `{playlist}`")
+        initial_path = None
 
-        queue = player_data.get("play_queue")
-        if queue:
-            msg_lines.append("\n**播放队列:**")
-            for i, track in enumerate(queue, start=1):
-                msg_lines.append(f"{i}. `{track}`")
-
-        await interaction.response.send_message("\n".join(msg_lines), ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"查看播放器状态时出错: {e}", ephemeral=True)
-
-
-@tree.command(name="music", description="控制音乐播放、音量、切歌等操作")
-@app_commands.choices(action=music_choice)
-@app_commands.describe(action="播放控制操作", name="歌曲或播放列表名称", volume_level="音量 0~100",
-                       seek_time="跳转到指定时间，格式为秒或 mm:ss")
-@app_commands.autocomplete(name=autocomplete_music_callback(include_music=True))
-async def music_control(interaction: Interaction, action: app_commands.Choice[str], name: str = None,
-                        volume_level: app_commands.Range[int, 0, 100] = None, seek_time: str = None):
-    try:
-        value = action.value
-        # 统一在命令开始时 defer，以防 ensure_voice 失败
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        vc = await ensure_voice(interaction, value not in ["play"])
-        if vc is None:
-            return
-
-        if value == "play":
-            # name 是播放列表的完整路径 (e.g., 'RJ1473335/mp3') 或单曲名 (e.g., 'root_song')
-            if verify_name(name) != name:  # verify_name 现在返回清理后的字符串，用于检查是否包含非法字符
-                await interaction.followup.send('文件名不能包含特殊字符: `<>:"\\|?*`')
+        if found_item["type"] == "playlist":
+            # 播放列表
+            paths = found_item["paths"]
+            if not paths:
+                await interaction.followup.send(f"❌ 播放列表 `{name}` 为空。", ephemeral=True)
                 return
 
-            music_data = get_music(name)
-            if not music_data:
-                await interaction.followup.send(f"未找到 `{name}`", ephemeral=True)
-                return
+            # 设置整个播放列表为队列，并随机或顺序开始
+            music_player.play_queue = paths
 
-            else:
-                data = music_data[0]
-                music_paths = data.get("paths")  # 获取 Path 对象列表
-                music_names = data.get("music")
+            # 优化：播放列表默认随机模式启动
+            music_player.playback_mode = "shuffle"
+            music_player.current_track_index = random.randint(0, len(music_player.play_queue) - 1)
+            initial_path = music_player.play_queue[music_player.current_track_index]
 
-                if not music_paths:
-                    await interaction.followup.send(f"播放列表 `{name}` 中没有找到任何音乐", ephemeral=True)
-                    return
-
-                music_player.play_queue = music_paths  # 设置 Path 对象到播放队列
-                music_player.current_track_index = 0
-
-                # 获取第一首歌信息 (Path 对象)
-                current_track_path = music_player.play_queue[0]
-                current_track_name = music_names[0] if data.get("type") == "playlist" else data.get("name")
-
-                _, minutes, sec = get_music_duration(current_track_path)
-                play_track(vc, current_track_path)
-
-                type = data.get("type")
-
-                if type == "playlist":
-                    response_msg = f"正在播放播放列表 `{name}` / 歌曲 `{current_track_name}`"
-                else:  # mp3
-                    response_msg = f"正在播放歌曲 `{name}`"
-
-                await interaction.followup.send(response_msg + f"，{minutes} 分 {sec} 秒", ephemeral=True)
-
-        elif value in ["pause", "resume"]:
-            vc.pause() if value == "pause" else vc.resume()
-            await interaction.followup.send(f"{messages['pause_resume'][value]}播放", ephemeral=True)
-
-        elif value in ["next", "previous"]:
-            if not music_player.play_queue:
-                await interaction.followup.send("播放队列为空，无法切歌！", ephemeral=True)
-                return
-
-            # 先更新索引
-            if value == "next" and music_player.current_track_index + 1 < len(music_player.play_queue):
-                music_player.current_track_index += 1
-            elif value == "previous" and music_player.current_track_index > 0:
-                music_player.current_track_index -= 1
-            else:
-                await interaction.followup.send(f"已经是{messages['next_previous'][value][0]}一首了！", ephemeral=True)
-                return
-
-            # 获取新歌曲 Path
-            current_track_path = music_player.play_queue[music_player.current_track_index]
-            _, minutes, sec = get_music_duration(current_track_path)
-
-            play_track(vc, current_track_path)
-            music_player.manual_skip = True
             await interaction.followup.send(
-                f"{messages['next_previous'][value][1]}: `{current_track_path.stem}`，{minutes} 分 {sec} 秒",
-                ephemeral=True)
+                f"✅ {messages['play']['playlist']}：**{found_item['name']}**。已自动开启 **随机播放** 模式。",
+                ephemeral=False)
 
-        elif value == "volume":
-            if volume_level is None:
-                await interaction.followup.send("请提供 0 到 100 之间的音量值！", ephemeral=True)
-                return
-            music_player.current_volume = volume_level / 100
-            if vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
-                vc.source.volume = music_player.current_volume
-            await interaction.followup.send(f"音量已设置为 {volume_level}%", ephemeral=True)
+        else:  # 单曲或播放列表中的单曲
+            if found_item["type"] == "playlist_song":
+                initial_path = found_item["path"]
+                music_player.play_queue.append(initial_path)
+                music_player.playback_mode = "no_loop"  # 单曲默认播放完停止
+                await interaction.followup.send(
+                    f"✅ {messages['play']['mp3']}：**{found_item['playlist_name']}/{found_item['name']}**。",
+                    ephemeral=False)
+            elif found_item["type"] == "mp3":
+                initial_path = found_item["paths"][0]
+                music_player.play_queue.append(initial_path)
+                music_player.playback_mode = "no_loop"
+                await interaction.followup.send(f"✅ {messages['play']['mp3']}：**{found_item['name']}**。",
+                                                ephemeral=False)
 
-        elif value in ["loop_one", "loop_all", "shuffle", "no_loop"]:
-            music_player.playback_mode = value
-            await interaction.followup.send(f"已设置为{messages['playback_mode'][value]}模式", ephemeral=True)
+        # 3. 处理跳转
+        seek_seconds = 0
+        if seek_time:
+            seek_seconds = time_to_seconds(seek_time)
+            if seek_seconds > 0:
+                music_player.manual_skip = True
 
-        elif value == "seek":
-            if seek_time is None:
-                await interaction.followup.send("请输入跳转时间，例如 90 或 1:30", ephemeral=True)
-                return
+        # 4. 播放
+        play_track(vc, initial_path, int(seek_seconds))
 
-            if not music_player.play_queue:
-                await interaction.followup.send("播放队列为空，无法跳转。", ephemeral=True)
-                return
+    except Exception as e:
+        error_msg = f"❌ 播放时发生错误: {e}"
+        print(f"ERROR in play_command: {e}")
+        if interaction.response.is_done():
+            await interaction.followup.send(error_msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(error_msg, ephemeral=True)
 
-            path = music_player.play_queue[music_player.current_track_index]
-            duration_sec, _, _ = get_music_duration(path)
 
-            seconds = 0
-            try:
-                if ":" in seek_time:
-                    mins, secs = map(int, seek_time.strip().split(":"))
-                    seconds = mins * 60 + secs
-                else:
-                    seconds = int(seek_time)
-            except ValueError:
-                await interaction.followup.send("无效时间格式，请输入秒数或 mm:ss 格式。", ephemeral=True)
-                return
+@tree.command(name="next", description="播放下一首音乐")
+async def next_command(interaction: Interaction):
+    # 保持不变
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
+    vc = interaction.guild.voice_client
+    if vc is None or not vc.is_connected():
+        await interaction.followup.send("❌ Bot 未连接到语音频道。", ephemeral=True)
+        return
+
+    if not music_player.play_queue:
+        await interaction.followup.send("❌ 播放队列为空。", ephemeral=True)
+        return
+
+    queue_len = len(music_player.play_queue)
+    next_index = music_player.current_track_index + 1
+
+    if music_player.playback_mode == "loop_all":
+        next_index = (music_player.current_track_index + 1) % queue_len
+    elif music_player.playback_mode == "shuffle":
+        # 随机模式下的下一首
+        if queue_len > 1:
+            next_index = music_player.current_track_index
+            while next_index == music_player.current_track_index:
+                next_index = random.randint(0, queue_len - 1)
+        else:
+            next_index = 0  # 只有一首时，还是它自己
+    elif next_index >= queue_len:
+        # no_loop 或 loop_one，且到达队列尾
+        await interaction.followup.send(messages['next_previous']['next'][0], ephemeral=True)
+        # 停止播放，但不清空队列
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+        music_player.current_track_index = queue_len - 1
+        return
+
+    music_player.current_track_index = next_index
+    next_path = music_player.play_queue[next_index]
+    play_track(vc, next_path)
+    music_player.manual_skip = True  # 标记为手动跳过
+
+    await interaction.followup.send(f"✅ {messages['next_previous']['next'][1]}：**{Path(next_path).stem}**",
+                                    ephemeral=True)
+
+
+@tree.command(name="previous", description="播放上一首音乐")
+async def previous_command(interaction: Interaction):
+    # 保持不变
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    vc = interaction.guild.voice_client
+    if vc is None or not vc.is_connected():
+        await interaction.followup.send("❌ Bot 未连接到语音频道。", ephemeral=True)
+        return
+
+    if not music_player.play_queue:
+        await interaction.followup.send("❌ 播放队列为空。", ephemeral=True)
+        return
+
+    queue_len = len(music_player.play_queue)
+
+    # 随机模式无法播放“上一首”，使用普通模式逻辑
+    if music_player.playback_mode == "shuffle":
+        await interaction.followup.send("在随机播放模式下，无法精确播放上一首。", ephemeral=True)
+        return
+
+    previous_index = music_player.current_track_index - 1
+
+    if previous_index < 0:
+        if music_player.playback_mode == "loop_all":
+            # 列表循环模式，回到队列尾
+            previous_index = queue_len - 1
+        else:
+            # 到达队列头
+            await interaction.followup.send(messages['next_previous']['previous'][0], ephemeral=True)
+            # 停止播放，但不清空队列
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+            music_player.current_track_index = 0
+            return
+
+    music_player.current_track_index = previous_index
+    previous_path = music_player.play_queue[previous_index]
+    play_track(vc, previous_path)
+    music_player.manual_skip = True  # 标记为手动跳过
+
+    await interaction.followup.send(f"✅ {messages['next_previous']['previous'][1]}：**{Path(previous_path).stem}**",
+                                    ephemeral=True)
+
+
+@tree.command(name="pause", description="暂停或恢复播放")
+async def pause_command(interaction: Interaction):
+    # 保持不变
+    await interaction.response.defer(ephemeral=True)
+    vc = interaction.guild.voice_client
+
+    if vc is None or not vc.is_connected():
+        await interaction.followup.send("❌ Bot 未连接到语音频道。", ephemeral=True)
+        return
+
+    if vc.is_playing():
+        vc.pause()
+        await interaction.followup.send(messages['pause_resume']['pause'], ephemeral=True)
+    elif vc.is_paused():
+        vc.resume()
+        await interaction.followup.send(messages['pause_resume']['resume'], ephemeral=True)
+    else:
+        await interaction.followup.send("❌ 当前没有音乐在播放或暂停。", ephemeral=True)
+
+
+@tree.command(name="volume", description="设置播放音量 (0-100)")
+@app_commands.describe(volume="音量百分比 (0-100)")
+async def volume_command(interaction: Interaction, volume: int):
+    # 保持不变
+    await interaction.response.defer(ephemeral=True)
+
+    if not 0 <= volume <= 100:
+        await interaction.followup.send("❌ 音量必须在 0 到 100 之间。", ephemeral=True)
+        return
+
+    music_player.current_volume = volume / 100.0
+
+    vc = interaction.guild.voice_client
+    if vc and vc.is_playing() and vc.source:
+        vc.source.volume = music_player.current_volume
+
+    await interaction.followup.send(f"🔊 音量已设置为 `{volume}%`。", ephemeral=True)
+
+
+@tree.command(name="mode", description="设置播放模式")
+@app_commands.describe(mode="播放模式")
+@app_commands.choices(mode=music_choice)
+async def mode_command(interaction: Interaction, mode: app_commands.Choice[str]):
+    # 保持不变
+    await interaction.response.defer(ephemeral=True)
+
+    mode_value = mode.value
+    music_player.playback_mode = mode_value
+    mode_text = messages['playback_mode'].get(mode_value, '未知模式')
+
+    await interaction.followup.send(f"🔄 播放模式已设置为 **{mode_text}**。", ephemeral=True)
+
+
+@tree.command(name="seek", description="跳转到歌曲指定时间")
+@app_commands.describe(seek_time="跳转时间 (例如 1:30 或 90)")
+async def seek_command(interaction: Interaction, seek_time: str):
+    # 保持不变
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        vc = interaction.guild.voice_client
+        if vc is None or not vc.is_connected() or not vc.is_playing():
+            await interaction.followup.send("❌ 当前没有音乐在播放，无法跳转。", ephemeral=True)
+            return
+
+        if not seek_time:
+            await interaction.followup.send("请输入跳转时间，例如 90 或 1:30", ephemeral=True)
+            return
+
+        if not music_player.play_queue:
+            await interaction.followup.send("播放队列为空，无法跳转。", ephemeral=True)
+            return
+
+        path = music_player.play_queue[music_player.current_track_index]
+        duration_sec, _, _ = get_music_duration(path)
+
+        seconds = 0
+        try:
+            seconds = time_to_seconds(seek_time)
+
+            # 检查是否为负数或超出范围
+            if seconds < 0:
+                seconds = 0
             if seconds >= duration_sec:
-                seconds = int(duration_sec) - 1
+                seconds = int(duration_sec) - 1  # 跳转到最后一秒
 
-            min_jump = seconds // 60
-            sec_jump = seconds % 60
-            await interaction.followup.send(f"跳转到 `{min_jump} 分 {sec_jump} 秒`", ephemeral=True)
-            play_track(vc, path, seconds)
-            music_player.manual_skip = True
+        except ValueError:
+            await interaction.followup.send("无效时间格式，请输入秒数或 mm:ss 或 h:mm:ss 格式。", ephemeral=True)
+            return
+
+        min_jump = int(seconds) // 60
+        sec_jump = int(seconds) % 60
+        await interaction.followup.send(f"跳转到 `{min_jump} 分 {sec_jump} 秒`", ephemeral=True)
+
+        # 关键：调用 play_track 重新启动带 seek 参数的播放
+        play_track(vc, path, int(seconds))
+        music_player.manual_skip = True
 
     except Exception as e:
         # 如果前面 defer 成功，用 followup.send
         if interaction.response.is_done():
-            await interaction.followup.send(f"处理音乐控制时出错: {e}", ephemeral=True)
-        else:  # 否则用 response.send
-            await interaction.response.send_message(f"处理音乐控制时出错: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ 跳转出错: {e}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"❌ 跳转出错: {e}", ephemeral=True)

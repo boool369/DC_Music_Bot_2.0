@@ -1,354 +1,251 @@
-from flask import Flask, render_template, request, Response
+from flask import Flask, render_template, request, jsonify
 from flask_socketio import SocketIO
 import os
 from uuid import uuid4
+# 确保导入了所有需要的工具函数和 Path
 from tools import get_player, get_music, music_dir, get_path, verify_name, download_status, check_music_open, \
     edit_play_queue, Path
 from downloader import download_task, extract_url
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from typing import Dict, Union, List, Any
 from dotenv import load_dotenv
 import shutil
 import re
-import dc  # 确保导入 dc
+import dc  # 导入 dc 以调用 dc.start()
+import threading  # 确保 threading 导入
+
+# --- 修复：确保 Bot 命令和事件在 Bot 启动前加载 ---
+# 必须先导入命令和事件文件，才能让 Discord Bot 注册这些命令
+import dc_command
+import dc_event
+
+# ----------------------------------------------------
+
 
 load_dotenv()
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.getenv("SECRET_KEY")
+# 优化：为 SECRET_KEY 提供更鲁棒的默认值
+app.config['SECRET_KEY'] = os.getenv("SECRET_KEY", uuid4().hex)
 socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 
 connected_sids = set()
 
 
-def get_player_data() -> Dict[str, str]:
-    """获取播放器状态"""
+# --- Utility Functions ---
+
+def get_player_data() -> Dict[str, Union[str, list[str]]]:
+    """获取播放器状态 (兼容 web 界面)"""
     try:
         player_data = get_player()
-        music = player_data.get("current_music")
-        if not music:
-            return {"updated_type": "player_status_updated", "message": "当前没有正在播放的音乐。"}
-
-        msg_lines = ["<strong><i class='fas fa-compact-disc'></i> 播放器状态</strong>"]
-        msg_lines.append(f"- 当前曲目: <code class='player-info-value'>{music}</code>")
-        msg_lines.append(
-            f"- 当前音量: <code class='player-info-value'>{player_data.get('current_volume', 'N/A')}</code>")
-        msg_lines.append(
-            f"- 播放模式: <code class='player-info-value'>{player_data.get('playback_mode', 'N/A')}</code>")
-
-        playlist = player_data.get("playlist_name")
-        if playlist:
-            msg_lines.append(f"- 当前播放列表: <code class='player-info-value'>{playlist}</code>")
-        queue = player_data.get("play_queue")
-
-        if queue:
-            msg_lines.append("<br><strong><i class='fas fa-list-ol'></i> 播放队列:</strong>")
-            for i, track in enumerate(queue, start=1):
-                msg_lines.append(f"{i}. <code class='player-info-value'>{track}</code>")
-
-        return {"updated_type": "player_status_updated", "message": "<br>".join(msg_lines)}
+        return {"updated_type": "player_status_updated", "data": player_data}
     except Exception as e:
-        return {"updated_type": "player_status_updated", "error": f"查看播放器状态时出错: {str(e)}"}
+        return {"updated_type": "player_status_updated", "error": f"获取播放器状态失败: {str(e)}"}
 
 
-def get_music_data() -> Dict[str, Union[str, List[Dict[str, Any]]]]:
-    """
-    获取音乐数据，将平铺的播放列表路径 ('RJ1473335/mp3') 转换成 Web 界面可用的树状结构。
-    """
+def get_music_data() -> Dict[str, Union[str, List[Dict]]]:
+    """获取音乐列表 (兼容 web 界面)"""
+    # 此函数会调用 tools.py 中的 get_music()，它现在依赖缓存。
     try:
-        music_data = get_music()
-        if not music_data:
-            return {"updated_type": "music_library_updated", "message": "当前没有任何音乐或播放列表。"}
-
-        music_tree = {}  # 用于构建树状结构
-
-        for music in music_data:
-            m_type = music.get("type")
-            m_name = music.get("name")  # 完整相对路径 (e.g., 'RJ1473335/mp3') 或单曲名
-
-            if m_type == "playlist":
-                # 将完整路径分解，构建树
-                parts = m_name.split('/')
-                current_level = music_tree
-
-                # 遍历路径的每一部分
-                for i, part in enumerate(parts):
-                    path_so_far = "/".join(parts[:i + 1])
-                    is_playable_folder = (i == len(parts) - 1)
-
-                    if part not in current_level:
-                        current_level[part] = {
-                            "name": part,
-                            "value": path_so_far,  # 完整相对路径 (内部使用)
-                            # 只有最深层级才是播放列表，上层是普通文件夹
-                            "type": "playlist" if is_playable_folder else "folder",
-                            "children": {}
-                        }
-
-                    if is_playable_folder:
-                        # 最后一层，添加歌曲列表
-                        current_level[part]["songs"] = [
-                            # Web 端的 value 是文件的 Web 路径，用于删除和播放
-                            {"name": song_name, "value": f"/mp3/{path_so_far}/{song_name}.mp3", "type": "song"}
-                            for song_name in music['music']
-                        ]
-                        # 播放列表文件夹的 value 应该是完整路径 /mp3/RJ1473335/mp3
-                        current_level[part]["value"] = f"/mp3/{path_so_far}"
-                        current_level[part]["name"] = f"{part} ({len(music['music'])} 首)"  # 文件夹名显示歌曲数
-                    else:
-                        # 普通文件夹的 value 应该是完整路径 /mp3/RJ1473335
-                        current_level[part]["value"] = f"/mp3/{path_so_far}"
-
-                    # 移动到下一层
-                    current_level = current_level[part]["children"]
-
-            elif m_type == "mp3":
-                # 根目录单曲
-                music_tree[m_name] = {
-                    "name": m_name,
-                    "value": f"/mp3/{m_name}.mp3",
-                    "type": "mp3",
-                    "path": f"/mp3/{m_name}.mp3",  # Web 访问路径
-                    "children": {}  # 不包含子项
+        # 不带参数调用 get_music()，它将返回缓存数据
+        music_list = get_music()
+        safe_music_list = []
+        if music_list:
+            for item in music_list:
+                safe_item = {
+                    "type": item["type"],
+                    "name": item["name"],  # 播放列表的完整相对路径
+                    "music": item.get("music", []),
+                    "song_count": len(item.get("music", [])) if item["type"] == "playlist" else 1
                 }
+                safe_music_list.append(safe_item)
 
-        # 将树状结构转换为 Web UI 列表
-        def tree_to_list(node: Dict) -> List[Dict]:
-            items = []
-            # 排序：文件夹/播放列表在前，mp3 在后
-            sorted_keys = sorted(node.keys(), key=lambda k: (node[k]["type"] == "mp3"), reverse=False)
-
-            for key in sorted_keys:
-                data = node[key]
-                item = {
-                    "name": data["name"],
-                    "value": data["value"],
-                    "type": data["type"],
-                    "songs": data.get("songs", [])
-                }
-                # 递归处理子项
-                if data["children"]:
-                    item["children"] = tree_to_list(data["children"])
-
-                items.append(item)
-            return items
-
-        return {"updated_type": "music_library_updated", "music_list": tree_to_list(music_tree)}
+        return {"updated_type": "music_list_updated", "music_list": safe_music_list}
     except Exception as e:
-        return {"updated_type": "music_library_updated", "error": f"查看音乐和播放列表时出错: {str(e)}"}
+        return {"updated_type": "music_list_updated", "error": f"获取音乐列表失败: {str(e)}"}
 
 
-@app.route("/")
-def index() -> Response:
-    """返回网站主页面"""
-    return render_template("index.html")
+# --- Routes ---
+
+@app.route('/')
+def index():
+    """主页"""
+    return render_template('index.html')
 
 
-@app.route("/mp3/download", methods=['POST'])
-def download_event() -> Dict[str, str]:
-    """处理提交的下载请求"""
+@app.route('/api/download', methods=['POST'])
+def download_route():
+    """处理下载请求 (Web API)"""
+    data = request.json
+    url = data.get('url')
+    playlist = data.get('playlist')
+
+    if not url:
+        return jsonify({"success": False, "message": "URL 不能为空"}), 400
+
+    valid_url = extract_url(url)
+    if not valid_url:
+        return jsonify({"success": False, "message": "请输入正确的视频链接"}), 400
+
+    if playlist:
+        if verify_name(playlist) != playlist:
+            return jsonify({"success": False, "message": "文件夹名不能包含特殊字符: <>:\"\\|?* (但允许 /)"}), 400
+
     try:
-        data = request.json
-        url = data.get("url")
-        playlist = data.get("playlist")  # Web UI 传来的 playlist value 是 /mp3/path/to/playlist
+        task_id = uuid4().hex
 
-        if not url:
-            return {"status": "error", "message": "URL 不能为空"}, 400
-        if not extract_url(url):
-            return {"status": "error", "message": "无效的视频链接格式"}, 400
-
-        # 验证播放列表名，如果存在
-        if playlist:
-            # 提取相对路径 (e.g., 'RJ1473335/mp3')
-            relative_playlist_path = re.sub(r'^/mp3/', '', playlist)
-            cleaned_playlist = verify_name(relative_playlist_path)
-
-            if not cleaned_playlist or cleaned_playlist != relative_playlist_path:
-                return {"status": "error", "message": f'播放列表文件夹名 "{relative_playlist_path}" 包含无效字符'}, 400
-
-            # 使用相对路径进行下载
-            playlist_for_download = relative_playlist_path
-        else:
-            playlist_for_download = None
-
-        download_id = uuid4().hex
-        for connected in list(connected_sids):
-            sid = dict(connected)['sid']
-            if data['sid'] == sid:
-                connected_sids.remove(connected)
-                connected_sids.add(
-                    frozenset({"sid": sid, "id": download_id, "playlist": playlist_for_download}.items()))
-
-                # 传入完整的 playlist 路径
-                folder_path = get_path(music_dir, playlist_for_download,
-                                       "%(title)s.%(ext)s") if playlist_for_download else get_path(music_dir,
+        folder_path = get_path(music_dir, playlist, "%(title)s.%(ext)s") if playlist else get_path(music_dir,
                                                                                                    filename="%(title)s.%(ext)s")
 
-                download_task.put({
-                    "id": download_id,
-                    "url": url,
-                    "folder": folder_path
-                })
-                return {"status": "pending", "message": "下载任务已提交"}
+        download_task.put({"id": task_id, "url": valid_url, "folder": folder_path})
 
-        return {"status": "error", "message": "请确保以连接服务器"}
+        return jsonify({"success": True, "message": "下载任务已添加", "id": task_id})
     except Exception as e:
-        return {"status": "error", "message": f"下载请求处理失败: {str(e)}"}, 500
+        print(f"ERROR in download_route: {e}")
+        return jsonify({"success": False, "message": f"添加下载任务失败: {str(e)}"}), 500
 
 
-@app.route("/mp3/delete", methods=['POST'])
-def delete_event() -> Dict[str, str]:
-    """处理提交的删除请求"""
+@app.route('/api/delete_music', methods=['POST'])
+def delete_music_route():
+    """处理删除请求 (Web API)"""
+    data = request.json
+    name = data.get('name')
+
+    if not name:
+        return jsonify({"success": False, "message": "名称不能为空"}), 400
+
     try:
-        data = request.json
-        item_path = data.get("item_path")
+        # 这里需要调用 get_music() 确保删除逻辑基于最新的文件列表
+        music_data = get_music(check="force_rescan")  # 删除前强制刷新索引
+        if not music_data:
+            return jsonify({"success": False, "message": f"未找到 `{name}`"}), 404
 
-        if not item_path:
-            return {"status": "error", "message": "删除对象不能为空"}, 400
+        is_playlist = any(m["name"] == name and m["type"] == "playlist" for m in music_data)
+        is_root_song = any(m["name"] == name and m["type"] == "mp3" for m in music_data)
+        is_playlist_song = "/" in name
 
-        # 移除前缀，获取相对路径
-        relative_path_str = re.sub(r'^/mp3/', '', item_path)
+        # 检查是否正在播放
+        if check_music_open(name):
+            return jsonify({"success": False, "message": f"`{name}` 正在播放中，请先停止播放。"}), 400
 
-        # 构建实际文件系统路径
-        path_to_delete = get_path(music_dir, filename=relative_path_str)
+        if is_playlist:
+            # 删除整个播放列表
+            path_to_delete = get_path(music_dir, subfolder=name)
+            if path_to_delete.exists():
+                shutil.rmtree(path_to_delete)
+                edit_play_queue(playlist=name)
+                # 删除后，强制刷新索引并通知 Web 客户端
+                get_music(check="force_rescan")
+                threading.Thread(target=lambda: socketio.emit("update_status", get_music_data())).start()
+                return jsonify({"success": True, "message": f"已删除播放列表: {name}", "deleted_type": "playlist"})
+            else:
+                return jsonify({"success": False, "message": f"播放列表目录不存在: {name}"}), 404
 
-        if path_to_delete.is_file():
-            # 删除单曲 (不论根目录还是子目录)
-            name_to_check = path_to_delete.stem  # 歌曲名
+        elif is_root_song:
+            # 删除根目录单曲
+            found_music = next((m for m in music_data if m["name"] == name and m["type"] == "mp3"), None)
+            if found_music and found_music['paths']:
+                path_to_delete = found_music['paths'][0]
+                if path_to_delete.exists():
+                    os.remove(path_to_delete)
+                    edit_play_queue(music=path_to_delete)
+                    # 删除后，强制刷新索引并通知 Web 客户端
+                    get_music(check="force_rescan")
+                    threading.Thread(target=lambda: socketio.emit("update_status", get_music_data())).start()
+                    return jsonify({"success": True, "message": f"已删除单曲: {name}", "deleted_type": "song"})
+                else:
+                    return jsonify({"success": False, "message": f"文件不存在: {name}"}), 404
+            else:
+                return jsonify({"success": False, "message": f"未找到单曲文件: {name}"}), 404
 
-            if check_music_open(name_to_check):
-                return {"status": "error",
-                        "message": f"{name_to_check} 在播放中，前往 Discord 机器人所在公会使用 /leave 后才可以删除"}, 400
+        elif is_playlist_song:
+            # 删除播放列表中的单曲 (格式: 列表路径/歌曲名)
+            playlist_name, song_name = name.rsplit("/", 1)
 
-            # 播放列表名是文件父目录的完整相对路径 (e.g., 'RJ1473335/mp3')
-            playlist_path = str(path_to_delete.parent.relative_to(Path(music_dir))).replace(os.path.sep, '/')
-            playlist_name = playlist_path if playlist_path != '.' else None
+            found_song = False
+            for m in music_data:
+                if m['name'] == playlist_name and m['type'] == 'playlist':
+                    for i, s_name in enumerate(m['music']):
+                        if s_name == song_name:
+                            path_to_delete = m['paths'][i]
+                            if path_to_delete.exists():
+                                os.remove(path_to_delete)
+                                edit_play_queue(music=path_to_delete)
+                                found_song = True
+                                break
+                    if found_song:
+                        # 删除后，强制刷新索引并通知 Web 客户端
+                        get_music(check="force_rescan")
+                        threading.Thread(target=lambda: socketio.emit("update_status", get_music_data())).start()
+                        return jsonify({"success": True, "message": f"已删除 {playlist_name} 中的歌曲: {song_name}",
+                                        "deleted_type": "playlist_song"})
 
-            os.remove(path_to_delete)
-            # edit_play_queue 需要 Path 对象和播放列表名（完整路径）
-            edit_play_queue(path_to_delete, music_name=name_to_check, playlist=playlist_name)
-            return {"status": "success", "message": f"已成功删除 {name_to_check}"}
-
-        elif path_to_delete.is_dir():
-            # 删除整个播放列表（文件夹），path_to_delete 是完整的目录路径
-
-            # name_to_check 是完整相对路径 (e.g., 'RJ1473335/mp3')
-            name_to_check = relative_path_str
-
-            if check_music_open(name_to_check):
-                return {"status": "error",
-                        "message": f"播放列表 {name_to_check} 正在播放中，使用 /leave 后才可以删除"}, 400
-
-            shutil.rmtree(path_to_delete)
-            # edit_play_queue 只需要 playlist 名（完整相对路径）
-            edit_play_queue(playlist=name_to_check)
-            return {"status": "success", "message": f"已成功删除播放列表 {name_to_check}"}
+            return jsonify({"success": False, "message": f"未找到歌曲: {name}"}), 404
 
         else:
-            return {"status": "error", "message": f"未找到要删除的对象 {item_path}"}, 400
+            return jsonify({"success": False, "message": f"未找到或名称格式不正确: {name}"}), 404
 
     except Exception as e:
-        return {"status": "error", "message": f"删除请求处理失败: {str(e)}"}, 500
+        print(f"ERROR in delete_music_route: {e}")
+        return jsonify({"success": False, "message": f"删除音乐失败: {str(e)}"}), 500
 
 
-@socketio.on("disconnect")
-def disconnect_handler():
-    """客户端断开连接"""
-    sid = request.sid
-    for connected in list(connected_sids):
-        if sid == dict(connected)['sid']:
-            connected_sids.discard(connected)
-            break
+# --- SocketIO and Background Tasks ---
+
+@socketio.on('connect')
+def handle_connect():
+    """处理客户端连接"""
+    connected_sids.add(request.sid)
+    # 首次连接时发送最新的音乐和播放器状态
+    socketio.emit("update_status", get_player_data(), to=request.sid)
+    socketio.emit("update_status", get_music_data(), to=request.sid)
+    print(f"SocketIO Client connected: {request.sid}")
 
 
-def download_status_update():
-    """根据 ID 获取下载进度，推送给对应的客户端"""
-    while True:
-        for connected in list(connected_sids):
-            connected_data = dict(connected)
-            id = connected_data.get("id")
-            if id:
-                status_data = download_status(query_id=id)
-                if status_data:
-                    status_data['updated_type'] = "download_status_updated"
-                    sid = connected_data.get("sid")
-                    socketio.emit("update_status", status_data, to=sid)
-                    if status_data.get("extra") == 100:
-                        title = status_data.get("title")
-                        playlist = connected_data.get("playlist")
-
-                        # 这里的路径是 download_task 传入的路径模板
-                        cleaned_title = verify_name(title)
-                        if playlist:
-                            final_path = get_path(music_dir, playlist, f"{cleaned_title}.mp3")
-                        else:
-                            final_path = get_path(music_dir, filename=f"{cleaned_title}.mp3")
-
-                        # edit_play_queue 需要 Path 对象和播放列表名（完整路径）
-                        edit_play_queue(final_path, cleaned_title, playlist)
-                        connected_sids.discard(connected)
-                        connected_sids.add(frozenset({"sid": sid}.items()))
-
-        socketio.sleep(0.5)
+@socketio.on('disconnect')
+def handle_disconnect():
+    """处理客户端断开连接"""
+    connected_sids.discard(request.sid)
+    print(f"SocketIO Client disconnected: {request.sid}")
 
 
-@socketio.on("update_status")
-def update_status_handler():
-    """客户端请求监听状态"""
-    sid = request.sid
-    socketio.emit("update_status", get_player_data(), to=sid)
-    socketio.emit("update_status", get_music_data(), to=sid)
-    connected_sids.add(frozenset({"sid": sid}.items()))
+def update_status_thread():
+    """每隔 0.5 秒推送一次播放器状态更新，【不再轮询音乐列表】"""
+    last_player_data = {}
 
+    with app.app_context():
+        while True:
+            # 1. 播放器状态检查 (每 0.5 秒)
+            try:
+                current_player_data = get_player()
+                data = {"updated_type": "player_status_updated", "data": current_player_data}
+            except Exception as e:
+                data = {"updated_type": "player_status_updated", "error": str(e)}
 
-def player_status_update():
-    """播放器状态变化，推送给所有监听中的客户端"""
-    last_data = None
+            if current_player_data != last_player_data:
+                for sid in list(connected_sids):
+                    socketio.emit("update_status", data, to=sid)
+                last_player_data = current_player_data
 
-    while True:
-        try:
-            player_data = get_player_data()
-            data = player_data
-        except Exception as e:
-            data = {"error": str(e)}
+            # 【注意：音乐列表轮询逻辑已移除】
 
-        if player_data != last_data:
-            for sid in list(connected_sids):
-                socketio.emit("update_status", data, to=dict(sid)['sid'])
-            last_data = player_data
-
-        socketio.sleep(0.5)
-
-
-class MusicDirEventHandler(FileSystemEventHandler):
-    """音乐目录监听器"""
-
-    def on_any_event(self, event: FileSystemEvent):
-        """音乐目录数据变化，推送给所有监听中的客户端"""
-        if event.event_type in ["created", "deleted", "moved"]:
-            # 延时 0.5 秒，确保文件系统操作完成
             socketio.sleep(0.5)
-            data = get_music_data()
-            for sid in list(connected_sids):
-                socketio.emit("update_status", data, to=dict(sid)['sid'])
 
 
-def start_music_observer():
-    """启动音乐目录监听"""
-    try:
-        os.makedirs(music_dir, exist_ok=True)
-        event_handler = MusicDirEventHandler()
+# --- Main Execution ---
 
-        observer = Observer()
-        observer.schedule(event_handler, music_dir, recursive=True)
-        observer.start()
-    except Exception as e:
-        print(f"音乐目录监听启动失败: {e}")
+# 启动状态更新线程
+threading.Thread(target=update_status_thread, daemon=True).start()
 
+if __name__ == '__main__':
+    # 启动 Flask 和 SocketIO
+    print("等待音乐索引初始化...")
+    # 1. 首次启动时先进行一次音乐扫描，填充索引 (只执行一次)
+    get_music(check="force_rescan")
+    print("音乐索引初始化完成，启动 Discord Bot。")
 
-start_music_observer()
-socketio.start_background_task(target=player_status_update)
-socketio.start_background_task(target=download_status_update)
-# 允许非安全 Werkzeug 重载器，避免出现问题
-socketio.run(app, host="0.0.0.0", port=5000, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
+    # 2. 启动 Discord Bot 线程 (确保在 music index 初始化后)
+    dc.start()
+
+    print("DEBUG: 已切换到手动刷新机制监控音乐目录。")
+
+    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)

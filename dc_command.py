@@ -12,6 +12,7 @@ import shutil
 import os
 # 【重要】导入 app 模块中的 SocketIO 相关函数，用于通知 Web 界面更新
 import app
+import random
 from app import socketio, get_music_data, connected_sids
 
 

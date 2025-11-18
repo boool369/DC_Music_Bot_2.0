@@ -30,7 +30,7 @@ class MusicPlayer:
         self.play_queue = []
         self.current_track_index = 0
         self.current_volume = 0.60
-        self.playback_mode = "no_loop"
+        self.playback_mode = "loop_all"
         self.manual_skip = False
 
 

@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands, Interaction
 import asyncio
+import re  # 引入re模块用于URL和时间解析
 from tools import download_status, get_music, music_dir, get_path, verify_name, get_music_duration, get_name, \
     get_player, check_music_open, edit_play_queue, Path
 from dc_config import tree, music_choice, messages, music_player
@@ -14,6 +15,54 @@ import os
 import app
 import random
 from app import socketio, get_music_data, connected_sids
+
+
+# =========================================================================
+# === 实用工具函数 (确保命令可运行) ===
+# =========================================================================
+
+def extract_url(url: str) -> Optional[str]:
+    """
+    从输入字符串中提取有效的URL。
+    用于 /download 命令。
+    """
+    # 查找以 http:// 或 https:// 开头的链接
+    url_pattern = re.compile(r"https?://[^\s]+")
+    match = url_pattern.search(url)
+    if match:
+        extracted_url = match.group(0)
+        # 进一步检查是否为YouTube或Bilibili (可以根据需求调整)
+        if "youtube.com" in extracted_url or "youtu.be" in extracted_url or "bilibili.com" in extracted_url:
+            return extracted_url
+        # 如果不是YouTube或Bilibili，但格式正确，也允许
+        return extracted_url
+    return None
+
+def time_to_seconds(time_str: str) -> int:
+    """
+    将时间字符串转换为秒数。
+    支持格式: 秒数(e.g., '90'), mm:ss (e.g., '1:30'), h:mm:ss (e.g., '1:01:30')
+    用于 /play 和 /seek 命令。
+    """
+    if not time_str:
+        return 0
+
+    time_str = time_str.strip()
+    
+    try:
+        # 尝试直接解析为整数秒
+        return int(float(time_str))
+    except ValueError:
+        # 尝试解析为时间格式
+        parts = time_str.split(':')
+        seconds = 0
+        if 1 < len(parts) <= 3:
+            # mm:ss 或 h:mm:ss
+            for i, part in enumerate(reversed(parts)):
+                seconds += int(part) * (60 ** i)
+            return seconds
+        else:
+            raise ValueError("无效的时间格式，请使用秒数或 mm:ss / h:mm:ss 格式。")
 
 
 # =========================================================================
@@ -58,13 +107,18 @@ async def status_command(interaction: Interaction):
     current_path_str = player_data.get("current_path")
     current_time_str = player_data.get("current_time", "0:00")
     total_time_str = player_data.get("total_time", "0:00")
+    
+    # 获取当前模式的中文文本
+    playback_mode_key = player_data.get('playback_mode', 'no_loop')
+    playback_mode_text = messages['playback_mode'].get(playback_mode_key, '播放完停止')
+
 
     # 构造美化的响应
     response_lines = [
         f"🎧 **播放器状态**",
         f"🎶 **当前状态:** `{player_data.get('status', '空闲')}`",
-        f"🔊 **音量:** `{player_data.get('current_volume', '60%')}`",
-        f"🔄 **循环模式:** `{player_data.get('playback_mode_text', '播放完停止')}`",
+        f"🔊 **音量:** `{player_data.get('current_volume', '60%') * 100:.0f}%`",
+        f"🔄 **循环模式:** `{playback_mode_text}`",
         "---"
     ]
 
@@ -133,7 +187,7 @@ async def download_command(interaction: Interaction, url: str, playlist: Optiona
         task_id = uuid4().hex
 
         folder_path = get_path(music_dir, playlist, "%(title)s.%(ext)s") if playlist else get_path(music_dir,
-                                                                                                   filename="%(title)s.%(ext)s")
+                                                                                                 filename="%(title)s.%(ext)s")
 
         download_task.put({"id": task_id, "url": valid_url, "folder": folder_path})
 
@@ -166,7 +220,8 @@ async def download_status_command(interaction: Interaction, task_id: str):
         get_music(check="force_rescan")
         if app.socketio:
             music_data = app.get_music_data()
-            app.socketio.emit("update_status", music_data)
+            # 广播给所有连接的客户端
+            app.socketio.emit("update_status", music_data) 
 
         message += f"✅ **状态:** 下载完成\n"
         message += f"📁 **文件:** `{status.get('filename')}`"
@@ -240,16 +295,16 @@ async def play_command(interaction: Interaction, name: str, seek_time: Optional[
                 await interaction.followup.send(f"❌ 播放列表 `{name}` 为空。", ephemeral=True)
                 return
 
-            # 设置整个播放列表为队列，并随机或顺序开始
+            # 设置整个播放列表为队列
             music_player.play_queue = paths
 
-            # 优化：播放列表默认随机模式启动
-            music_player.playback_mode = "shuffle"
-            music_player.current_track_index = random.randint(0, len(music_player.play_queue) - 1)
+            # 修改为：播放列表默认顺序播放模式启动 (播放完停止)
+            music_player.playback_mode = "no_loop"
+            music_player.current_track_index = 0  # 从第一首开始顺序播放
             initial_path = music_player.play_queue[music_player.current_track_index]
 
             await interaction.followup.send(
-                f"✅ {messages['play']['playlist']}：**{found_item['name']}**。已自动开启 **随机播放** 模式。",
+                f"✅ {messages['play']['playlist']}：**{found_item['name']}**。已自动开启 **顺序播放** 模式。",
                 ephemeral=False)
 
         else:  # 单曲或播放列表中的单曲
@@ -265,7 +320,7 @@ async def play_command(interaction: Interaction, name: str, seek_time: Optional[
                 music_player.play_queue.append(initial_path)
                 music_player.playback_mode = "no_loop"
                 await interaction.followup.send(f"✅ {messages['play']['mp3']}：**{found_item['name']}**。",
-                                                ephemeral=False)
+                                               ephemeral=False)
 
         # 3. 处理跳转
         seek_seconds = 0
@@ -328,7 +383,7 @@ async def next_command(interaction: Interaction):
     music_player.manual_skip = True  # 标记为手动跳过
 
     await interaction.followup.send(f"✅ {messages['next_previous']['next'][1]}：**{Path(next_path).stem}**",
-                                    ephemeral=True)
+                                   ephemeral=True)
 
 
 @tree.command(name="previous", description="播放上一首音乐")
@@ -373,7 +428,7 @@ async def previous_command(interaction: Interaction):
     music_player.manual_skip = True  # 标记为手动跳过
 
     await interaction.followup.send(f"✅ {messages['next_previous']['previous'][1]}：**{Path(previous_path).stem}**",
-                                    ephemeral=True)
+                                   ephemeral=True)
 
 
 @tree.command(name="pause", description="暂停或恢复播放")
@@ -410,6 +465,7 @@ async def volume_command(interaction: Interaction, volume: int):
 
     vc = interaction.guild.voice_client
     if vc and vc.is_playing() and vc.source:
+        # discord.py的FFmpegOpusAudio source有一个volume属性
         vc.source.volume = music_player.current_volume
 
     await interaction.followup.send(f"🔊 音量已设置为 `{volume}%`。", ephemeral=True)
@@ -462,13 +518,19 @@ async def seek_command(interaction: Interaction, seek_time: str):
             if seconds >= duration_sec:
                 seconds = int(duration_sec) - 1  # 跳转到最后一秒
 
-        except ValueError:
-            await interaction.followup.send("无效时间格式，请输入秒数或 mm:ss 或 h:mm:ss 格式。", ephemeral=True)
+        except ValueError as ve:
+            await interaction.followup.send(f"❌ 无效时间格式：{ve}", ephemeral=True)
             return
 
         min_jump = int(seconds) // 60
         sec_jump = int(seconds) % 60
-        await interaction.followup.send(f"跳转到 `{min_jump} 分 {sec_jump} 秒`", ephemeral=True)
+        
+        # 确保跳转时间不会导致播放结束，但又要接近尾声
+        if seconds >= duration_sec:
+            seconds = max(0, int(duration_sec) - 1)
+            await interaction.followup.send(f"⚠️ 跳转时间超过歌曲长度，已自动跳转到末尾：`{min_jump} 分 {sec_jump} 秒`", ephemeral=True)
+        else:
+            await interaction.followup.send(f"✅ 跳转到 `{min_jump} 分 {sec_jump} 秒`", ephemeral=True)
 
         # 关键：调用 play_track 重新启动带 seek 参数的播放
         play_track(vc, path, int(seconds))
@@ -476,7 +538,9 @@ async def seek_command(interaction: Interaction, seek_time: str):
 
     except Exception as e:
         # 如果前面 defer 成功，用 followup.send
+        error_msg = f"❌ 跳转出错: {e}"
+        print(f"ERROR in seek_command: {e}")
         if interaction.response.is_done():
-            await interaction.followup.send(f"❌ 跳转出错: {e}", ephemeral=True)
+            await interaction.followup.send(error_msg, ephemeral=True)
         else:
-            await interaction.response.send_message(f"❌ 跳转出错: {e}", ephemeral=True)
+            await interaction.response.send_message(error_msg, ephemeral=True)

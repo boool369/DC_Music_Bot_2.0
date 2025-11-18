@@ -163,7 +163,13 @@ def get_music(check: Optional[str] = None) -> Optional[List[Dict[str, Union[str,
         return None
 
     # rglob 递归查找所有多媒体文件
-    all_files = list(music_path.rglob('*.mp3')) + list(music_path.rglob('*.m4a')) + list(music_path.rglob('*.flac'))
+    all_files = (
+    list(music_path.rglob('*.mp3')) + 
+    list(music_path.rglob('*.m4a')) + 
+    list(music_path.rglob('*.flac')) +
+    list(music_path.rglob('*.ogg')) +  # <--- 新增格式
+    list(music_path.rglob('*.wav'))    # <--- 新增格式
+    )
 
     playlists = {}
 
